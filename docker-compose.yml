@@ -1,0 +1,37 @@
+services:
+  youtube-bridge:
+    build: .
+    container_name: youtube-bridge
+    restart: unless-stopped
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-base}
+      - VIRTUAL_HOST=${VIRTUAL_HOST:-}
+      - LETSENCRYPT_HOST=${LETSENCRYPT_HOST:-}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
+      - VIRTUAL_PORT=8000
+    volumes:
+      - ./cache:/tmp/yt-cache
+    tmpfs:
+      - /tmp:size=1G
+    ports:
+      - "${PORT:-8000}:8000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    networks:
+      - webproxy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+networks:
+  webproxy:
+    external: true
+    name: webproxy
