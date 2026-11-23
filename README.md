@@ -92,6 +92,18 @@ The service will be available at `http://localhost:8000`.
 
 If you're running [nginx-proxy-automation](https://github.com/evertramos/nginx-proxy-automation) with Let's Encrypt, set `VIRTUAL_HOST`, `LETSENCRYPT_HOST`, and `LETSENCRYPT_EMAIL` in your `.env` file.
 
+## Running behind a SOCKS proxy
+
+YouTube often blocks or rate-limits requests from datacenter IP addresses. Set `HTTP_PROXY` and
+`HTTPS_PROXY` in `.env` (for example `socks5h://proxy-host:1080`) and both yt-dlp and the transcript
+client send their traffic through it. Leave them empty to connect directly.
+
+## Images
+
+Every push to `main`, and a nightly run, builds the image, smoke-tests it, scans it with Trivy and publishes
+`ghcr.io/asimzeeshan/youtube-bridge:latest` only when its content changed. Python dependencies are locked in
+`requirements.txt` (generated from `requirements.in` with `uv pip compile`); Dependabot keeps them current.
+
 ## Whisper models
 
 The Whisper fallback model can be configured via the `WHISPER_MODEL` environment variable:

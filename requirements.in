@@ -1,0 +1,9 @@
+# Direct dependencies. requirements.txt is the locked, full list generated from this file:
+#   uv pip compile requirements.in -o requirements.txt --python-version 3.11 --python-platform x86_64-unknown-linux-gnu --upgrade
+fastapi
+uvicorn
+yt-dlp
+youtube-transcript-api
+requests[socks]
+httpx[socks]
+faster-whisper

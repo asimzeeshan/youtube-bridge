@@ -9,6 +9,10 @@ services:
       - LETSENCRYPT_HOST=${LETSENCRYPT_HOST:-}
       - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
       - VIRTUAL_PORT=8000
+      # Optional outbound proxy for YouTube (e.g. socks5h://host:1080); empty = direct
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
     volumes:
       - ./cache:/tmp/yt-cache
     tmpfs:

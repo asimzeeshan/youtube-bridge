@@ -1,0 +1,196 @@
+name: Build, test and publish image
+
+# Nightly + on push: build from a freshly pulled base with Debian security fixes,
+# smoke-test /health, compare with the published image, scan with a digest-pinned Trivy,
+# and publish to GHCR only when something changed and no NEW fixable CRITICAL appeared.
+# Pull requests (including Dependabot) build, test and scan but never publish.
+# Dependabot patch/minor PRs that pass are merged automatically; the nightly run ships them.
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+  schedule:
+    - cron: '30 19 * * *'   # 19:30 UTC daily (after the php base image build at 19:00)
+  workflow_dispatch:
+    inputs:
+      force_push:
+        description: "Publish even if the image content did not change"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # merge Dependabot PRs
+  pull-requests: write   # merge Dependabot PRs
+  packages: write        # push to GHCR
+  actions: write         # keepalive step
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/youtube-bridge
+  # Every path must answer 200 before anything is published or auto-merged.
+  SMOKE_PATHS: "/health /docs /openapi.json"
+  # Port the app listens on inside the container, the page that must answer 200 before
+  # the other paths are tried, and extra `docker run` arguments for the smoke test only
+  # (for example -e FLAG=1 so an app that logs in to a third party at startup skips it).
+  APP_PORT: "8000"
+  HEALTH_PATH: /health
+  SMOKE_DOCKER_ARGS: ""
+  # Trivy pinned by digest (0.76.2). Not the trivy-action: its tags were hijacked in March 2026.
+  TRIVY: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (local only)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          no-cache: true
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:candidate
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            fleet.source-tree=${{ github.sha }}
+
+      - name: Smoke test (container starts, every SMOKE_PATHS page answers 200)
+        run: |
+          # shellcheck disable=SC2086
+          docker run -d --name smoke -p 18000:"$APP_PORT" $SMOKE_DOCKER_ARGS "$IMAGE:candidate"
+          for i in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18000$HEALTH_PATH" || true)" = 200 ] && break; sleep 2
+          done
+          fail=0
+          for p in $SMOKE_PATHS; do
+            code=$(curl -s -o /dev/null -m 30 -w '%{http_code}' "http://127.0.0.1:18000$p" || true)
+            echo "$p -> $code"; [ "$code" = 200 ] || fail=1
+          done
+          docker logs smoke 2>&1 | grep -i -E "error|traceback" | head -20 || true
+          docker rm -f smoke >/dev/null
+          [ $fail = 0 ] || { echo "::error::smoke test failed"; exit 1; }
+
+      # What the image contains: OS packages, Python packages, source tree.
+      - name: Compare with the published image
+        id: diff
+        run: |
+          # OS packages, Python packages, app files, and the image config (ENV/CMD/USER/...),
+          # so a change that only edits configuration is still detected and published.
+          fp() {
+            { docker run --rm --entrypoint sh "$1" -c "dpkg-query -W -f='\${Package} \${Version}\n'; python -m pip list --format=freeze 2>/dev/null"
+              docker run --rm --entrypoint sh "$1" -c "cd /app && find . -type f -not -path './logs/*' -not -path '*/__pycache__/*' -exec sha256sum {} + | sort"
+              docker image inspect -f '{{json .Config.Env}}{{json .Config.Cmd}}{{json .Config.Entrypoint}}{{.Config.WorkingDir}}|{{.Config.User}}|{{json .Config.ExposedPorts}}{{json .Config.Volumes}}' "$1"
+            } | sha256sum | cut -d' ' -f1
+          }
+          NEW=$(fp "$IMAGE:candidate")
+          if docker pull -q "$IMAGE:latest" >/dev/null 2>&1; then OLD=$(fp "$IMAGE:latest"); else OLD=none; fi
+          [ "$NEW" = "$OLD" ] && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+          { echo "### Image content"; echo "- candidate: \`$NEW\`"; echo "- published: \`$OLD\`"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Vulnerability scan (fixable HIGH/CRITICAL)
+        id: scan
+        run: |
+          mkdir -p scan trivy-cache
+          # download the vulnerability DB with retries, so a flaky network is not mistaken for a finding
+          for i in 1 2 3; do docker run --rm -v "$PWD/trivy-cache:/root/.cache" "$TRIVY" image --download-db-only -q && break; echo "DB download failed, retry $i"; sleep 20; done
+          scan() { docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/trivy-cache:/root/.cache" -v "$PWD/scan:/scan" "$TRIVY" image -q --skip-db-update \
+            --image-src docker --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format json --output "/scan/$2.json" "$1"; }
+          scan "$IMAGE:candidate" candidate
+          # First publish: no baseline exists, so report but do not block (the image it replaces is a server-side build).
+          if docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then scan "$IMAGE:latest" published; else echo '{"first":true}' > scan/published.json; fi
+          python3 - <<'PY'
+          import json, os
+          def ids(f, sev):
+              d = json.load(open(f))
+              return {v["VulnerabilityID"] for r in d.get("Results", []) for v in (r.get("Vulnerabilities") or []) if v["Severity"] == sev}
+          new_c, old_c = ids("scan/candidate.json", "CRITICAL"), ids("scan/published.json", "CRITICAL")
+          new_h, old_h = ids("scan/candidate.json", "HIGH"), ids("scan/published.json", "HIGH")
+          first = json.load(open("scan/published.json")).get("first", False)
+          added = [] if first else sorted(new_c - old_c)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write("### Fixable vulnerabilities\n")
+              s.write(f"- CRITICAL: candidate {len(new_c)}, published {len(old_c)}, fixed by this build {len(old_c - new_c)}, new {len(added)}\n")
+              s.write(f"- HIGH: candidate {len(new_h)}, published {len(old_h)}, fixed by this build {len(old_h - new_h)}\n")
+              if first: s.write("- first publish: no baseline, gate not applied\n")
+              if added: s.write("- NEW CRITICAL (blocks publishing): " + ", ".join(added) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o:
+              o.write(f"new_critical={len(added)}\n")
+          PY
+
+      - name: Block on new fixable CRITICAL
+        if: steps.scan.outputs.new_critical != '0'
+        run: |
+          echo "::error::The candidate image adds fixable CRITICAL vulnerabilities. Not publishing."
+          exit 1
+
+      - name: Publish
+        if: github.event_name != 'pull_request' && (steps.diff.outputs.changed == 'true' || inputs.force_push)
+        run: |
+          D=$(date +%Y%m%d); S=${GITHUB_SHA::7}
+          for t in latest "$D" "sha-$S"; do docker tag "$IMAGE:candidate" "$IMAGE:$t"; docker push -q "$IMAGE:$t"; done
+          echo "### Published \`$IMAGE:latest\`, \`:$D\`, \`:sha-$S\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to publish
+        if: github.event_name != 'pull_request' && steps.diff.outputs.changed != 'true' && !inputs.force_push
+        run: echo "### Unchanged, not published" >> "$GITHUB_STEP_SUMMARY"
+
+      # Dependabot: merge patch/minor updates once build, health check and scan passed.
+      - name: Dependabot metadata
+        id: meta
+        if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
+        uses: dependabot/fetch-metadata@v3
+      - name: Merge Dependabot patch/minor update
+        # allowlist: an empty or unknown update-type never merges
+        if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]' && contains(fromJSON('["version-update:semver-patch","version-update:semver-minor"]'), steps.meta.outputs.update-type)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge "${{ github.event.pull_request.number }}" --squash --delete-branch -R "${{ github.repository }}"
+
+      - name: Tell Slack when a nightly or push build fails
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: C0CKFD368MD  # private channel #github-alerts
+          IS_TEST: ${{ inputs.test_failure_alert }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$SLACK_BOT_TOKEN" ] || exit 0
+          payload=$(python3 - <<'PY'
+          import json, os
+          test = os.environ.get("IS_TEST") == "true"
+          trigger = {"schedule": "nightly build", "push": "push to the main branch", "workflow_dispatch": "manual run"}.get(os.environ["EVENT"], os.environ["EVENT"])
+          title = ":test_tube: *Test alert, please ignore*" if test else ":x: *Image build failed*"
+          text = f"{title}\n`{os.environ['REPO']}` · {trigger} · nothing was published"
+          print(json.dumps({"channel": os.environ["SLACK_CHANNEL"], "attachments": [{"color": "#9e9e9e" if test else "#d32f2f",
+              "fallback": f"Image build failed: {os.environ['REPO']}", "blocks": [
+              {"type": "section", "text": {"type": "mrkdwn", "text": text},
+               "accessory": {"type": "button", "text": {"type": "plain_text", "text": "View run"}, "url": os.environ["RUN_URL"]}}]}]}))
+          PY
+          )
+          reply=$(curl -s -m 20 -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$payload" https://slack.com/api/chat.postMessage)
+          echo "Slack replied: $reply"
+          # chat.postMessage answers {"ok":true,...} only when the message was posted
+          echo "$reply" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' \
+            || { echo "::error::Slack did not accept the alert: $reply"; exit 1; }
+
+      - name: Keep scheduled workflow alive
+        if: always() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable"

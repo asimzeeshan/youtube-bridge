@@ -1,24 +1,22 @@
+# deno: the JavaScript runtime yt-dlp needs for YouTube (pinned; Dependabot bumps this line)
+FROM denoland/deno:bin-2.7.12 AS deno
+
 FROM python:3.11-slim
+
+# Debian security fixes released since the base image was built, plus ffmpeg for audio extraction
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y upgrade \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY --from=deno /deno /usr/local/bin/deno
+
+# uv for fast, reproducible Python installs (pinned; Dependabot bumps it)
+COPY --from=ghcr.io/astral-sh/uv:0.13.9 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# System deps for audio processing
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install deno (required by yt-dlp for YouTube JS extraction)
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
-
-# Python deps
-RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
-    yt-dlp \
-    youtube-transcript-api \
-    faster-whisper
+COPY requirements.txt .
+RUN uv pip install --system --no-cache -r requirements.txt
 
 COPY app.py .
 

@@ -1,0 +1,18 @@
+# Keep repo metadata, local environments and docs out of the image.
+.git
+.github
+.gitignore
+.dockerignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.md
+docs
+docker-compose*.yml
+.env
+.env.*
+# keep the logs folder (the app writes there), not its contents
+logs/*
+!logs/.gitkeep
