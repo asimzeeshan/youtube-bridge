@@ -1,5 +1,5 @@
 # deno: the JavaScript runtime yt-dlp needs for YouTube (pinned; Dependabot bumps this line)
-FROM denoland/deno:bin-2.7.12 AS deno
+FROM denoland/deno:bin-2.9.8 AS deno
 
 FROM python:3.11-slim
 
